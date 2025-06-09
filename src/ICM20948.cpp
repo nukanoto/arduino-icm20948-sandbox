@@ -8,6 +8,8 @@ ICM20948::ICM20948()
     temperature = 0.0f;
     accelSensitivity = 1.0f;
     gyroSensitivity = 1.0f;
+    magX = magY = magZ = 0.0f;
+    magSensitivity = 0.15f; // AK09916: 0.15 μT/LSB
 }
 
 bool ICM20948::begin(uint8_t address)
@@ -108,4 +110,211 @@ void ICM20948::readRegister(uint8_t reg, uint8_t *data, uint8_t len)
 void ICM20948::setBank(uint8_t bank)
 {
     writeRegister(REG_BANK_SEL, (bank & 0x03) << 4);
+}
+
+bool ICM20948::initMagnetometer()
+{
+    // Check magnetometer WHO_AM_I
+    if (!checkMagnetometer())
+    {
+        return false;
+    }
+
+    // Set continuous measurement mode (20Hz) following Waveshare approach
+    writeSecondary(I2C_ADD_ICM20948_AK09916 | I2C_ADD_ICM20948_AK09916_WRITE,
+                   REG_ADD_MAG_CNTL2, REG_VAL_MAG_MODE_20HZ);
+    delay(10);
+
+    return true;
+}
+
+void ICM20948::readMagnetometer()
+{
+    uint8_t counter = 20;
+    uint8_t data[MAG_DATA_LEN];
+    int16_t rawBuf[3] = {0};
+    int32_t avgBuf[3] = {0};
+    static MagAvgData avgData[3];
+
+    // Wait for data ready - checking ST2 register like Waveshare
+    while (counter > 0)
+    {
+        delay(10);
+        readSecondary(I2C_ADD_ICM20948_AK09916 | I2C_ADD_ICM20948_AK09916_READ,
+                      REG_ADD_MAG_ST2, 1, data);
+
+        if ((data[0] & 0x01) != 0)
+            break;
+
+        counter--;
+    }
+
+    if (counter != 0)
+    {
+        // Read magnetometer data (6 bytes)
+        readSecondary(I2C_ADD_ICM20948_AK09916 | I2C_ADD_ICM20948_AK09916_READ,
+                      REG_ADD_MAG_DATA, MAG_DATA_LEN, data);
+
+        // Convert to 16-bit signed values (little endian)
+        rawBuf[0] = ((int16_t)data[1] << 8) | data[0];
+        rawBuf[1] = ((int16_t)data[3] << 8) | data[2];
+        rawBuf[2] = ((int16_t)data[5] << 8) | data[4];
+    }
+
+    // Apply averaging like Waveshare implementation
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        calcAvgValue(&avgData[i].index, avgData[i].buffer, rawBuf[i], &avgBuf[i]);
+    }
+
+    // Convert to μT and apply Waveshare coordinate adjustments
+    magX = avgBuf[0] * magSensitivity;
+    magY = -avgBuf[1] * magSensitivity; // Y inverted like Waveshare
+    magZ = -avgBuf[2] * magSensitivity; // Z inverted like Waveshare
+}
+
+float ICM20948::getHeading()
+{
+    float heading = atan2(magY, magX) * 180.0 / M_PI;
+
+    // Normalize to 0-360 degrees
+    if (heading < 0)
+    {
+        heading += 360.0;
+    }
+
+    return heading;
+}
+
+float ICM20948::getTiltCompensatedHeading()
+{
+    // Calculate roll and pitch from accelerometer
+    float roll = atan2(accelY, accelZ);
+    float pitch = atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ));
+
+    // Tilt compensation
+    float magX_comp = magX * cos(pitch) + magZ * sin(pitch);
+    float magY_comp = magX * sin(roll) * sin(pitch) + magY * cos(roll) - magZ * sin(roll) * cos(pitch);
+
+    // Calculate heading
+    float heading = atan2(magY_comp, magX_comp) * 180.0 / M_PI;
+
+    // Normalize to 0-360 degrees
+    if (heading < 0)
+    {
+        heading += 360.0;
+    }
+
+    return heading;
+}
+
+float ICM20948::getMagneticFieldStrength()
+{
+    return sqrt(magX * magX + magY * magY + magZ * magZ);
+}
+
+bool ICM20948::needsMagnetometerCalibration()
+{
+    float fieldStrength = getMagneticFieldStrength();
+
+    // Earth's magnetic field is typically 25-65 μT
+    const float MIN_FIELD_STRENGTH = 15.0f;
+    const float MAX_FIELD_STRENGTH = 100.0f;
+
+    return (fieldStrength < MIN_FIELD_STRENGTH || fieldStrength > MAX_FIELD_STRENGTH);
+}
+
+// Helper methods for magnetometer I2C communication based on Waveshare implementation
+bool ICM20948::checkMagnetometer()
+{
+    bool result = false;
+    uint8_t data[2];
+
+    readSecondary(I2C_ADD_ICM20948_AK09916 | I2C_ADD_ICM20948_AK09916_READ,
+                  REG_ADD_MAG_WIA1, 2, data);
+
+    if ((data[0] == REG_VAL_MAG_WIA1) && (data[1] == REG_VAL_MAG_WIA2))
+    {
+        result = true;
+    }
+
+    return result;
+}
+
+void ICM20948::readSecondary(uint8_t addr, uint8_t reg, uint8_t len, uint8_t *data)
+{
+    uint8_t temp;
+
+    setBank(3); // Switch to bank 3
+    writeRegister(REG_ADD_I2C_SLV0_ADDR, addr);
+    writeRegister(REG_ADD_I2C_SLV0_REG, reg);
+    writeRegister(REG_ADD_I2C_SLV0_CTRL, REG_VAL_BIT_SLV0_EN | len);
+
+    setBank(0); // Switch to bank 0
+
+    temp = readRegister8(UB0_USER_CTRL);
+    temp |= REG_VAL_BIT_I2C_MST_EN;
+    writeRegister(UB0_USER_CTRL, temp);
+    delay(5);
+    temp &= ~REG_VAL_BIT_I2C_MST_EN;
+    writeRegister(UB0_USER_CTRL, temp);
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        data[i] = readRegister8(REG_ADD_EXT_SENS_DATA_00 + i);
+    }
+
+    setBank(3); // Switch to bank 3
+    temp = readRegister8(REG_ADD_I2C_SLV0_CTRL);
+    temp &= ~(REG_VAL_BIT_SLV0_EN | 0x0F); // Clear enable bit and length
+    writeRegister(REG_ADD_I2C_SLV0_CTRL, temp);
+
+    setBank(0); // Switch to bank 0
+}
+
+void ICM20948::writeSecondary(uint8_t addr, uint8_t reg, uint8_t data)
+{
+    uint8_t temp;
+
+    setBank(3); // Switch to bank 3
+    writeRegister(REG_ADD_I2C_SLV1_ADDR, addr);
+    writeRegister(REG_ADD_I2C_SLV1_REG, reg);
+    writeRegister(REG_ADD_I2C_SLV1_DO, data);
+    writeRegister(REG_ADD_I2C_SLV1_CTRL, REG_VAL_BIT_SLV0_EN | 1);
+
+    setBank(0); // Switch to bank 0
+
+    temp = readRegister8(UB0_USER_CTRL);
+    temp |= REG_VAL_BIT_I2C_MST_EN;
+    writeRegister(UB0_USER_CTRL, temp);
+    delay(5);
+    temp &= ~REG_VAL_BIT_I2C_MST_EN;
+    writeRegister(UB0_USER_CTRL, temp);
+
+    setBank(3); // Switch to bank 3
+    temp = readRegister8(REG_ADD_I2C_SLV0_CTRL);
+    temp &= ~(REG_VAL_BIT_SLV0_EN | 0x0F); // Clear enable bit and length
+    writeRegister(REG_ADD_I2C_SLV0_CTRL, temp);
+
+    setBank(0); // Switch to bank 0
+}
+
+void ICM20948::calcAvgValue(uint8_t *index, int16_t *avgBuffer, int16_t inVal, int32_t *outVal)
+{
+    avgBuffer[(*index)++] = inVal;
+    *index &= 0x07; // Keep index in range 0-7
+
+    *outVal = 0;
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        *outVal += avgBuffer[i];
+    }
+    *outVal >>= 3; // Divide by 8
+}
+
+uint8_t ICM20948::readRegister8(uint8_t reg)
+{
+    uint8_t data;
+    readRegister(reg, &data, 1);
+    return data;
 }

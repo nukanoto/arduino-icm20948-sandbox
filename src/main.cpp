@@ -78,19 +78,29 @@ void setup()
             delay(500); // Wait indefinitely
         }
     }
+
+    if (mySensor.initMagnetometer())
+    {
+        Serial.println("Magnetometer initialization successful.");
+    }
+    else
+    {
+        Serial.println("Magnetometer initialization failed. Stopping.");
+        while (1)
+        {
+            Serial.println("Magnetometer initialization failed. Stopping.");
+            delay(500); // Wait indefinitely
+        }
+    }
 }
 
 void loop()
 {
-    /*
-    scanI2C();
-    delay(500);
-    */
-
-    // センサーデータを読み込み、内部の変数を更新
+    // Read sensor data and update internal variables
     mySensor.readSensors();
+    mySensor.readMagnetometer(); // Add this line
 
-    // データを取得して表示
+    // Get and display data
     Serial.println("--- Sensor Data ---");
 
     // 加速度 (g)
@@ -110,6 +120,30 @@ void loop()
     Serial.print(mySensor.getGyroY(), 3);
     Serial.print(" | Z=");
     Serial.println(mySensor.getGyroZ(), 3);
+
+    // 磁力計データ (μT)
+    Serial.print("Magnetometer (μT): ");
+    Serial.print("X=");
+    Serial.print(mySensor.getMagX(), 3);
+    Serial.print(" | Y=");
+    Serial.print(mySensor.getMagY(), 3);
+    Serial.print(" | Z=");
+    Serial.println(mySensor.getMagZ(), 3);
+
+    // ヘディング
+    Serial.print("Heading (degrees): ");
+    Serial.println(mySensor.getHeading(), 2);
+
+    Serial.print("Tilt-compensated heading (degrees): ");
+    Serial.println(mySensor.getTiltCompensatedHeading(), 2);
+
+    Serial.print("Magnetic field strength (μT): ");
+    Serial.println(mySensor.getMagneticFieldStrength(), 2);
+
+    if (mySensor.needsMagnetometerCalibration())
+    {
+        Serial.println("Warning: Magnetometer calibration recommended!");
+    }
 
     // 温度 (°C)
     Serial.print("Temperature (°C): ");
